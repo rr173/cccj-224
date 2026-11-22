@@ -132,8 +132,11 @@ CREATE TABLE IF NOT EXISTS attribution_results (
 
 
 def connect(db_path):
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets a delivery keep a stable read snapshot while another publisher
+    # commits a new version concurrently.
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
     return conn

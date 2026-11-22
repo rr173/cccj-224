@@ -16,6 +16,7 @@ Semantics
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -24,7 +25,10 @@ from .attribution import (SnapshotReader, attribute_all, attribute_customer,
                           diff_customers, rows_digest, validate_rows)
 from .dates import gran_of, is_day
 from .db import connect
-from .errors import EventError, PlanError, SnapshotError, StateError
+from .delivery import (AtomicTarget, Candidate, canon_line, choose_versions,
+                       day_range, iter_result_rows, touch_window)
+from .errors import (DeliveryError, EventError, PlanError, SnapshotError,
+                     StateError)
 from .graph import attribution_roles, normalize, upstream_roles
 from .impact import build_plan_items, compute_impact
 
@@ -816,6 +820,227 @@ class RecomputePlanner:
                 "baseline_version": r["baseline_version"],
                 "input_versions": json.loads(r["input_versions_json"]),
                 "report": json.loads(r["report_json"]), "created_at": r["created_at"]}
+
+    # ------------------------------------------------------------------
+    # consistent cross-day delivery
+    # ------------------------------------------------------------------
+    def deliver_attribution_range(self, node, start, end, target,
+                                  orders_node=None, touches_node=None):
+        """Write one consistent per-order JSONL delivery for ``[start, end]``.
+
+        ``node`` is the materialized attribution node; ``orders_node`` and
+        ``touches_node`` name its upstreams.  When omitted they are inferred
+        from the shape of the materialized run records (one upstream partition
+        equal to the order day, one covering the seven-day touch window).
+
+        Picks, for every order day in the inclusive UTC range, one published
+        attribution version that was actually materialized and whose recorded
+        inputs pin orders/day and touches/[day-6..day] at exact versions.
+        Selected days must agree on the version of every touch day they share
+        (the touch version is constrained even if no touch there wins an
+        order); different days may use different order versions.  Among all
+        consistent choices the tuple of attribution versions read latest order
+        day first is maximised (numeric ``vN`` order, version string as
+        tie-break).  Nothing is planned, registered or recomputed, and the
+        current graph / latest upstream versions are not consulted.
+
+        The candidate scan, the run records and the per-order rows share one
+        deferred read transaction, so a version published mid-delivery cannot
+        join this selection.  Rows are streamed day by day; the target is
+        replaced only once the whole file is written.  On any failure the
+        previous target is left intact and no partial file remains.  Raises
+        DeliveryError (see its ``code``).
+        """
+        days = day_range(start, end)
+        path = os.fspath(target)
+        directory = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(directory):
+            raise DeliveryError(
+                f"target directory {directory!r} does not exist", code="invalid_target")
+
+        self.conn.commit()
+        self.conn.execute("BEGIN")  # deferred: snapshot fixed at the first read
+        reader_active = True
+        try:
+            candidates, orders_node, touches_node = self._delivery_candidates(
+                node, days, orders_node, touches_node)
+            chosen = choose_versions(days, candidates)
+            orders_each = {c.day: c.orders_version for c in chosen}
+            manifest = {
+                "kind": "attribution-delivery-manifest",
+                "node": node,
+                "orders_node": orders_node,
+                "touches_node": touches_node,
+                "date_range": {"start": days[0], "end": days[-1]},
+                "touch_window": 7,
+                # ascending day order; one concrete version per day
+                "days": [{
+                    "date": c.day,
+                    "attribution_version": c.version,
+                    "input_versions": {
+                        orders_node: {c.day: c.orders_version},
+                        touches_node: c.touches,
+                    },
+                } for c in chosen],
+            }
+            out = AtomicTarget(path)
+            rows_written = 0
+            try:
+                out.write(canon_line(manifest))
+                for c in chosen:
+                    for row in iter_result_rows(
+                            self.conn, node, c.day, c.version):
+                        out.write(canon_line({
+                            "order_date": c.day,
+                            "order_id": row["order_id"],
+                            "attribution_version": c.version,
+                            "orders_version": orders_each[c.day],
+                            "touch_date": row["touch_date"],
+                            "touch_id": row["touch_id"],
+                            "channel": row["channel"],
+                        }))
+                        rows_written += 1
+                self.conn.rollback()  # release the read snapshot before replacing
+                reader_active = False
+                out.commit()
+            except BaseException:
+                out.abort()
+                raise
+        except DeliveryError:
+            raise
+        except Exception as exc:
+            self._safe_rollback(reader_active)
+            raise DeliveryError(f"delivery failed: {exc}", code="read") from exc
+        finally:
+            self._safe_rollback(reader_active)
+
+        return {
+            "target": path,
+            "node": node,
+            "orders_node": orders_node,
+            "touches_node": touches_node,
+            "date_range": {"start": days[0], "end": days[-1]},
+            "days": list(manifest["days"]),
+            "rows": rows_written,
+        }
+
+    def _safe_rollback(self, active):
+        if not active:
+            return
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+
+    def _delivery_candidates(self, node, days, orders_node=None, touches_node=None):
+        """Usable attribution versions per day, read in the current transaction.
+
+        Candidate eligibility depends only on the materialized records -- never
+        on which upstream versions are latest now or on whether the producing
+        plan is still retained.  The current graph is consulted only to
+        validate the node kind and, when the caller did not name the upstreams,
+        to resolve their roles; failing that they are inferred from records.
+        """
+        if (orders_node is None) != (touches_node is None):
+            raise DeliveryError(
+                "orders_node and touches_node must be given together",
+                code="invalid_inputs")
+        if orders_node is not None and orders_node == touches_node:
+            raise DeliveryError("orders_node and touches_node must differ",
+                                code="invalid_inputs")
+
+        graph_row = self.conn.execute(
+            "SELECT def_json FROM graphs WHERE graph_id="
+            " (SELECT value FROM meta WHERE key='current_graph')").fetchone()
+        gdef = json.loads(graph_row["def_json"]) if graph_row else None
+        if gdef is not None:
+            spec = gdef["nodes"].get(node)
+            if spec is None:
+                raise DeliveryError(f"unknown node {node!r}", code="unknown_node")
+            if spec.get("materialize") != "attribution":
+                raise DeliveryError(f"node {node!r} is not attribution-materialized",
+                                    code="not_attribution")
+            if orders_node is None:
+                orders_node, touches_node = attribution_roles(spec)
+
+        out = {}
+        inferred = orders_node is None
+        inferred_pair = None
+        for day in days:
+            window = set(touch_window(day))
+            options = []
+            runs = self.conn.execute(
+                "SELECT version, input_versions_json FROM attribution_runs"
+                " WHERE node=? AND partition=? ORDER BY"
+                " CAST(SUBSTR(version, 2) AS INTEGER), version",
+                (node, day)).fetchall()
+            for run in runs:
+                version = run["version"]
+                if not _VERSION_RE.match(version):
+                    continue
+                if self._published_version(node, day, version) is None:
+                    continue  # a run without a published version is not usable
+                pins = self._pinned_inputs(json.loads(run["input_versions_json"]),
+                                           day, window, orders_node, touches_node)
+                if pins is None:
+                    continue  # record does not pin exactly the required inputs
+                o_node, t_node, o_ver, t_vers = pins
+                if inferred:
+                    if inferred_pair is None:
+                        inferred_pair = (o_node, t_node)
+                    elif inferred_pair != (o_node, t_node):
+                        raise DeliveryError(
+                            "materialized runs disagree on the upstream node names;"
+                            " pass orders_node and touches_node explicitly",
+                            code="invalid_inputs")
+                options.append(Candidate(day, version, o_ver, t_vers))
+            out[day] = options
+        if orders_node is None and inferred_pair is not None:
+            orders_node, touches_node = inferred_pair
+        if orders_node is None:
+            raise DeliveryError(
+                f"cannot resolve the upstream nodes of {node!r}",
+                code="no_candidate")
+        return out, orders_node, touches_node
+
+    def _published_version(self, node, partition, version):
+        return self.conn.execute(
+            "SELECT 1 FROM published WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone()
+
+    @staticmethod
+    def _pinned_inputs(inputs, day, window, orders_node, touches_node):
+        """(orders_node, touches_node, order version, {touch day: version}) if
+        the record pins exactly the required partitions at exact versions,
+        else None.
+
+        One upstream must provide only ``day`` (the orders role) and another
+        must provide exactly the seven touch days (the touches role).  Extra
+        or missing partitions, or a non-``vN`` value, make the record unusable
+        for a consistent delivery.
+        """
+        if not isinstance(inputs, dict) or not inputs:
+            return None
+        if orders_node is not None:
+            candidates = [(orders_node, inputs.get(orders_node)),
+                          (touches_node, inputs.get(touches_node))]
+        else:
+            candidates = list(inputs.items())
+        orders = [u for u, parts in candidates
+                  if isinstance(parts, dict) and set(parts) == {day}]
+        touches = [u for u, parts in candidates
+                   if isinstance(parts, dict) and set(parts) == window]
+        if len(orders) != 1 or len(touches) != 1:
+            return None
+        o_node, t_node = orders[0], touches[0]
+        if o_node == t_node:
+            return None
+        o_ver = inputs[o_node][day]
+        t_vers = inputs[t_node]
+        for value in [o_ver, *t_vers.values()]:
+            if not isinstance(value, str) or not _VERSION_RE.match(value):
+                return None
+        return o_node, t_node, o_ver, dict(t_vers)
 
     # ------------------------------------------------------------------
     # bounded retention

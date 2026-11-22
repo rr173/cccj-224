@@ -1,8 +1,8 @@
 """Late-event driven minimal recompute planner."""
 
 from .api import RecomputePlanner
-from .errors import (EventError, GraphError, PlanError, PlannerError,
-                     SnapshotError, StateError)
+from .errors import (DeliveryError, EventError, GraphError, PlanError,
+                     PlannerError, SnapshotError, StateError)
 
 __all__ = [
     "RecomputePlanner",
@@ -12,5 +12,6 @@ __all__ = [
     "PlanError",
     "EventError",
     "SnapshotError",
+    "DeliveryError",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

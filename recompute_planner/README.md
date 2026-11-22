@@ -14,12 +14,15 @@ planner/            产品实现
   graph.py          图规范化与校验（缺边、成环、范围声明矛盾、物化节点形态）
   impact.py         纯函数影响传播与计划项构造（创建与重放共用，保证确定性）
   attribution.py    归因纯逻辑：快照校验、逐单归因、按客户增量重算、读取边界记录
+  delivery.py       跨日一致交付：候选枚举、按日链 DP 选版、流式逐单读取、原子目标
   dates.py / db.py  分区键日期运算 / SQLite schema
 reference/ref_impl.py  独立图算法参考实现（不调用产品计划器，只输出集合与前置关系）
 tests/test_planner.py     计划器手算场景 + 全部边界用例
 tests/test_attribution.py 归因物化：独立逐单枚举交叉验证 + 增量/钉版/原子性用例
+tests/test_delivery.py    跨日交付：手算回退、独立枚举交叉验证、不可拼齐、原子性
 examples/run_scenario.py    重算计划端到端演示
 examples/run_attribution.py 归因物化端到端演示
+examples/run_delivery.py    跨日一致交付演示
 ```
 
 ## 图声明
@@ -61,6 +64,7 @@ examples/run_attribution.py 归因物化端到端演示
 | `run_attribution_item(pid, node, part)` | 物化一个归因计划项：按计划项钉住的输入版本计算逐单结果，与所用输入版本、计划项成功发布同事务生效 |
 | `read_attribution(node, day, version)` | 按归因日期 + 精确版本号读逐单结果（订单 ID、命中触点日期/ID/渠道） |
 | `attribution_run_info(node, day, version)` | 物化元数据：full/incremental、基线版本、实际读入的输入版本、运行报告 |
+| `deliver_attribution_range(node, start, end, target, orders_node=None, touches_node=None)` | 交付一份覆盖首尾均包含 UTC 日期范围的逐单 JSONL：每天各选一个可拼齐的已物化版本，写入清单行 + 订单行；不建计划、不登记、不重算。上游节点名可省略（按记录推断） |
 
 ## 订单归因物化
 
@@ -96,6 +100,56 @@ examples/run_attribution.py 归因物化端到端演示
   旧结果仍可读、新版本不可见、该项可重试；成功过的项在计划保留期内不能重复发布；
   重开数据库后旧结果仍按原版本读取。
 
+## 跨日一致交付（归因明细）
+
+结算团队按周取一份逐单归因明细，要求同一份交付里**每个触点日只有一种版本**：
+归因日 `D` 与 `D+1` 的 7 日触点窗口重叠 6 天，若两天分别选中读了同一触点日
+不同版本的两份成品，明细就无法自洽。`deliver_attribution_range(node, start, end,
+target)` 负责按一个整体口径选版并写出 JSONL：
+
+```python
+run = p.deliver_attribution_range("attr", "2026-11-01", "2026-11-07", "out.jsonl")
+run["orders_node"], run["touches_node"]   # "orders", "touches"（可显式传入）
+run["days"]   # [{"date": ..., "attribution_version": ..., "input_versions":
+              #    {"orders": {day: "vN"}, "touches": {7 天各一版}}}, ...]
+```
+
+**候选**（只看成品记录，不读当前图 / 上游最新版 / 计划是否还在）：
+
+- 该归因日在 `attribution_runs` 里有物化记录，且同版本号在 `published` 里已发布；
+- 该记录的 `input_versions` **恰好**覆盖订单当天 + 触点当天及前六天，并且每个分区
+  都写明唯一的确切版本号（缺分区、多出分区、同分区多版本、非 `vN` 都判为不可用）。
+
+只有发布标记而没有物化记录的不算候选；零订单的物化版本（结果为空）仍可候选，
+因此“已物化空日”与“未物化”能区分开。上游节点名可显式给出，否则按记录中
+“只有一个该订单日分区”“只有一个恰含七天的触点窗口”推断。
+
+**一致性**：任选两天各自选中的候选，只要都读了同一触点日，该触点日的版本号必须
+完全相同（即使该触点日没有任何触点赢得订单也参与约束）；不同订单日的订单版本
+可以不同。
+
+**最优选择**：在所有可行组合中，把每天的归因版本按订单日从晚到早排列，取字典序
+最大的一组（同日 `vN` 按数字、再按版本字符串比较）。因此若某天最高版本无法与
+范围内其他天拼齐，就会真正回退整组，而不是“先挑最高再往前补”。实现是沿日期链的
+动态规划（相邻两天只需比较重叠触点日，代价按每天的候选数平方增长），不枚举各日
+候选的笛卡尔积。
+
+**失败**：某天没有候选（`code="no_candidate"`）、或每天都有候选但无法拼齐
+（`code="no_solution"`）都抛出 `DeliveryError`，不跳过日期、不写半份文件。
+
+**交付格式**：首行是清单
+`{"kind":"attribution-delivery-manifest","node":...,"orders_node":...,"touches_node":...,
+"date_range":{"start":...,"end":...},"days":[{"date":...,"attribution_version":...,
+"input_versions":{...}}...]}`（`days` 按日期升序）；其后每行一笔订单：
+`order_date`、`order_id`、`attribution_version`、`orders_version`、`touch_date`、
+`touch_id`、`channel`。未归因订单照常输出，后三项为 `null`。整份文件先按订单日、
+再按订单 ID 字符串排序；同 ID 跨日重名不合并。
+
+**读视图与原子性**：候选扫描、物化记录与逐单结果共用同一个延迟读事务（WAL 快照），
+交付途中新发布的版本不会混入本次选择。逐单结果按天逐行读取，不在内存里攒整段明细。
+文件先写同目录临时文件，全部完成后 `os.replace` 替换目标；中途任何读取/写入失败都
+回滚并删除临时文件，已有目标保持上一份完整内容。不支持多个调用者同时覆盖同一目标。
+
 ## 关键不变量
 
 - **不可变版本**：`published` 仅追加，计划只分配 `v(max+1)`，旧版本永远保留；
@@ -114,8 +168,10 @@ examples/run_attribution.py 归因物化端到端演示
 cd recompute_planner
 python3 -m unittest tests.test_planner -v      # 19 项计划器测试
 python3 -m unittest tests.test_attribution -v  # 9 项归因物化测试
+python3 -m unittest tests.test_delivery -v     # 20 项跨日交付测试
 python3 examples/run_scenario.py               # 重算计划端到端演示
 python3 examples/run_attribution.py            # 归因物化端到端演示
+python3 examples/run_delivery.py               # 跨日一致交付演示
 ```
 
 ## 测试场景（手算）
@@ -129,3 +185,10 @@ python3 examples/run_attribution.py            # 归因物化端到端演示
 计划 ID 绑定、有界保留、进程重开，以及**计划状态与事件接收交错**（计划执行中途
 到达新事件，核对下一计划不漏裁剪也不过度扩散）；独立参考实现只输出集合与前置
 关系，与产品计划器逐项交叉验证。
+
+跨日交付测试另覆盖：最近两天最新成品兼容、却与更早一天冲突时整组回退（手算 +
+独立枚举）；已物化空日与仅有发布标记未物化的区分；记录输入未精确覆盖所需分区
+时不算候选；某天无候选与“各天都有成品但不可拼齐”两类失败都不写半份文件；
+程序生成的多日候选（每天 5–6 版、多种订单版本形成大量等价局部选择）与独立
+笛卡尔积枚举交叉验证，并计数兼容性比较次数证明选版不靠枚举整组；已写出部分内容
+后的 IO 失败保留旧目标；选版期间另一连接发布新版本不会混入本次交付、下次交付可见。

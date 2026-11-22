@@ -128,6 +128,69 @@ CREATE TABLE IF NOT EXISTS attribution_results (
     channel     TEXT,
     PRIMARY KEY (node, partition, version, order_id)
 );
+
+-- Weekly channel reward books, keyed by "node|UTC-Monday".  A book's pools
+-- are fixed by its first receipt.
+CREATE TABLE IF NOT EXISTS reward_books (
+    book_id    TEXT PRIMARY KEY,
+    node       TEXT NOT NULL,
+    week_start TEXT NOT NULL,             -- UTC Monday
+    pools_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- One immutable receipt per settlement step.  receipt_no is unique per book;
+-- seq orders the chain; prev_receipt_no records exactly which receipt this
+-- one corrects (NULL for the first).  A receipt exists even when every delta
+-- is zero, so the audit trail keeps the number and the approved digest.
+CREATE TABLE IF NOT EXISTS reward_receipts (
+    book_id         TEXT NOT NULL,
+    receipt_no      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    node            TEXT NOT NULL,
+    week_start      TEXT NOT NULL,
+    prev_receipt_no TEXT,                 -- NULL for the first receipt
+    file_sha256     TEXT NOT NULL,
+    file_size       INTEGER NOT NULL,
+    approved_digest TEXT NOT NULL,
+    manifest_json   TEXT NOT NULL,        -- the accepted manifest (never the rows)
+    pools_json      TEXT NOT NULL,
+    payout_json     TEXT NOT NULL,        -- per-channel delta + entitlement
+    line_count      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (book_id, receipt_no),
+    -- at most one successor per receipt inside a book
+    UNIQUE (book_id, prev_receipt_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reward_receipts_seq
+    ON reward_receipts (book_id, seq);
+
+-- Per-order, per-channel signed settlement lines of one receipt.
+CREATE TABLE IF NOT EXISTS reward_lines (
+    book_id    TEXT NOT NULL,
+    receipt_no TEXT NOT NULL,
+    order_date TEXT NOT NULL,
+    order_id   TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    amount     INTEGER NOT NULL,          -- signed; never zero
+    PRIMARY KEY (book_id, receipt_no, order_date, order_id, channel),
+    FOREIGN KEY (book_id, receipt_no)
+        REFERENCES reward_receipts (book_id, receipt_no)
+);
+
+-- Entitlement baseline after the latest receipt: the full per-order channel
+-- entitlement of the open receipt, used by the next correction.  Written in
+-- the same transaction as the receipt, so a correction never has to re-read an
+-- older JSONL.
+CREATE TABLE IF NOT EXISTS reward_state (
+    book_id    TEXT NOT NULL,
+    order_date TEXT NOT NULL,
+    order_id   TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    amount     INTEGER NOT NULL,
+    PRIMARY KEY (book_id, order_date, order_id, channel)
+);
 """
 
 

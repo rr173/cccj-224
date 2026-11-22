@@ -20,9 +20,12 @@ reference/ref_impl.py  独立图算法参考实现（不调用产品计划器，
 tests/test_planner.py     计划器手算场景 + 全部边界用例
 tests/test_attribution.py 归因物化：独立逐单枚举交叉验证 + 增量/钉版/原子性用例
 tests/test_delivery.py    跨日交付：手算回退、独立枚举交叉验证、不可拼齐、原子性
+tests/test_rewards.py     周奖励入账：手算首单与更正、独立参考交叉验证、幂等/冲突/
+                          原子性/重开
 examples/run_scenario.py    重算计划端到端演示
 examples/run_attribution.py 归因物化端到端演示
 examples/run_delivery.py    跨日一致交付演示
+examples/run_rewards.py     周奖励入账演示
 ```
 
 ## 图声明
@@ -65,6 +68,72 @@ examples/run_delivery.py    跨日一致交付演示
 | `read_attribution(node, day, version)` | 按归因日期 + 精确版本号读逐单结果（订单 ID、命中触点日期/ID/渠道） |
 | `attribution_run_info(node, day, version)` | 物化元数据：full/incremental、基线版本、实际读入的输入版本、运行报告 |
 | `deliver_attribution_range(node, start, end, target, orders_node=None, touches_node=None)` | 交付一份覆盖首尾均包含 UTC 日期范围的逐单 JSONL：每天各选一个可拼齐的已物化版本，写入清单行 + 订单行；不建计划、不登记、不重算。上游节点名可省略（按记录推断） |
+
+## 周奖励入账（`RewardLedger`）
+
+结算侧把 `deliver_attribution_range` 产出、并经业务确认的逐单归因明细，转成
+**可追溯的逐单补扣流水**。只做 Python 调用 + SQLite 持久化，不接支付系统，也不修改
+归因和跨日选版逻辑（新模块 `planner/rewards.py`，独立于计划器/图）。
+
+```python
+from planner import RewardLedger
+
+with RewardLedger("rewards.db") as ledger:
+    receipt = ledger.post_weekly_rewards(
+        node="attr",                       # 归因节点
+        week_start="2026-10-05",           # UTC 周一
+        delivery_path="week.jsonl",        # deliver_attribution_range 的产物
+        approved_digest="<文件 SHA-256>",   # 业务审批时记录
+        receipt_no="R-2026-41-1",
+        prev_receipt_no=None,              # 首单为空；更正是上一张单号
+        pools={"email": 100, "ads": 50},   # 渠道固定周奖池，非负整数分
+    )
+    ledger.iter_reward_lines("attr", "2026-10-05", "R-2026-41-1")
+    ledger.read_reward_receipt("attr", "2026-10-05", "R-2026-41-1")
+    ledger.list_reward_receipts("attr", "2026-10-05")
+    ledger.reward_week_summary("attr", "2026-10-05")
+```
+
+**账簿键**：`(归因节点, UTC 周一)`，落库为 `book_id = "node|YYYY-MM-DD"`。只受理
+周一至周日整周：`week_start` 必须是 UTC 周一，文件清单 `date_range` 必须是本周
+周一..周日，`days` 必须恰好覆盖这 7 天各一条；某天或整周没有订单都合法（整周为
+空也能入账）。订单以 `(order_date, order_id)` 区分，跨日同名不合并；逐单结果
+也可以只有名称相同但日期不同（不是重复）。每个账簿的奖池由首单固定，之后任何
+参数变化都会被拒。
+
+**输入校验**（任何一项不满足都整单拒绝，不写半份）：
+- 处理字节的 SHA-256 必须等于 `approved_digest`（先在读文件时算，结构错误不能
+  掩盖摘要不符；第二次流式读取时再算一遍并比对，防止校验与入账之间换文件）；
+- 清单/明细必须可解析，清单是 `attribution-delivery-manifest` 且 `node` 与账簿一致；
+- 明细必须与当天清单的归因版本、订单输入版本一致；`touch_date/touch_id/channel`
+  三项**全空表示未归因**，只填一部分视为无效；`touch_date` 必须落在能喂给本
+  周的触点窗口内（周一前 6 天 .. 周日）；同一 `(order_date, order_id)` 只能出现
+  一次。
+
+**分配**：有归因且渠道在奖池里的订单参与该渠道分配；未归因、渠道未配置、或该
+渠道本周无人参与的订单都不分。每个渠道按本周参与订单数平分（SQLite 整数除法），
+余数按 `(订单日, 订单 ID 字符串)` 升序每个参与者至多补 1 分。
+
+**差量**：更正文件代表**当前整周**，不是更改列表。对每个 `(订单, 渠道)` 记
+`本次应得 - 上次已入账应得`；首单以前次全为零。原渠道扣回与新渠道补入是两条
+不同流水，从文件消失的订单也按旧金额扣回。是否调账**不按**「是否换渠道/是否换
+归因版本」判断：归属没变但参与人数、余数顺序变化导致的几分钱差额同样入账。
+零差额不产生流水，但仍留单据（单号、摘要、前单、奖池、汇总）以供审计。
+
+**幂等与冲突**：同一账簿下，相同单号 + 文件摘要 + 前单 + 奖池 + 审批摘要可安全
+重试，即使已有更晚单据也只返回原单；同单号换内容或参数拒绝。`prev_receipt_no`
+必须等于当前未结单号，否则拒为过期前单；两张不同单据同时引用同一前单时只有
+一张能入账（事务内比较 + 单号唯一 + 唯一前单约束）。单据、流水、供下次更正使用
+的基线（`reward_state`）在同一事务提交；写入流水途中失败时全部回滚，不留下可见
+残账，也不占用单号。历史单据不可改，库重开后仍可查阅；更正不依赖之前的 JSONL。
+
+**有界内存**：参与者集合、余数排名、差量都在 SQLite 临时表（`temp_store=FILE`，
+磁盘暂存）里计算，Python 只保留当前页/批次，不攒整周或整渠道的订单与流水。
+
+**错误码**（`RewardError.code`）：`invalid_inputs` / `invalid_pools` /
+`invalid_week` / `invalid_digest` / `digest_mismatch` / `invalid_delivery` /
+`invalid_row` / `version_mismatch` / `immutable_pools` / `stale_predecessor` /
+`receipt_conflict` / `unknown_receipt` / `read` / `write` / `state`。
 
 ## 订单归因物化
 
@@ -159,6 +228,8 @@ run["days"]   # [{"date": ..., "attribution_version": ..., "input_versions":
 - **有界状态**：计划只读 pending 事件与脏债（不做全历史重算）；已消费事件与旧计划
   按 `max_events` / `max_plans` 裁剪；重放所需输入快照存在计划行内，事件被裁剪后
   仍可重放。
+- **奖励账簿**：奖池首单后不可变；单据/流水/基线同事务提交且不可变；同一单号
+  重试幂等、换内容拒绝；前单只能被一张单据消费；零差额也留单据。
 - **计划 ID 绑定**：`plan_id = H(图版本 ‖ 事件集合 ‖ 脏债 ‖ 发布状态快照)`，
   相同输入产生相同 ID；篡改任一计划项会导致 `replay_plan` 不匹配。
 
@@ -169,9 +240,11 @@ cd recompute_planner
 python3 -m unittest tests.test_planner -v      # 19 项计划器测试
 python3 -m unittest tests.test_attribution -v  # 9 项归因物化测试
 python3 -m unittest tests.test_delivery -v     # 20 项跨日交付测试
+python3 -m unittest tests.test_rewards -v      # 22 项周奖励入账测试
 python3 examples/run_scenario.py               # 重算计划端到端演示
 python3 examples/run_attribution.py            # 归因物化端到端演示
 python3 examples/run_delivery.py               # 跨日一致交付演示
+python3 examples/run_rewards.py                # 周奖励入账演示
 ```
 
 ## 测试场景（手算）
@@ -192,3 +265,24 @@ python3 examples/run_delivery.py               # 跨日一致交付演示
 程序生成的多日候选（每天 5–6 版、多种订单版本形成大量等价局部选择）与独立
 笛卡尔积枚举交叉验证，并计数兼容性比较次数证明选版不靠枚举整组；已写出部分内容
 后的 IO 失败保留旧目标；选版期间另一连接发布新版本不会混入本次交付、下次交付可见。
+
+## 周奖励入账测试场景（手算）
+
+用真实 `deliver_attribution_range` 产出 2026-10-05..10-11 的交付作为输入，
+奖池 `email=100, ads=50, social=30`。
+
+首单（v1）：email 5 单（10-05 a1/a2/a3/b1，10-06 c1）→ 各 20；ads 2 单（d1、e1）
+→ 各 25；social 1 单（e2）→ 30。
+
+更正（v2）：a1 改为 10-06/ads，b1 消失。email 3 单 → 33/33/33 余 1 给最早的
+10-05/a2（34）；ads 3 单 → 16/16/16 余 2 给最早的 10-06/a1 与 d1（各 17），
+e1=16；social 不变。逐单差量：
+`a1/email -20`、`a1/ads +17`、`b1/email -20`、`a2/email +14`、`a3/email +13`、
+`c1/email +13`、`d1/ads -8`、`e1/ads -9`，各渠道累计均为 0。其中 a2/a3/c1/d1/e1
+的归属没变，只因人数和余数顺序变化而补扣，验证了「不按是否换渠道判断」。
+
+测试另覆盖：旧单重试（含已有更晚单据时）、同号换内容/参数、过期前单、两张单
+抢同一前单（含另一连接/并发线程）、审批摘要不符与换文件、非整周/清单缺日重复日、
+明细越界/重复/部分归因/版本不符、零差额留单、写入流水中途失败后重试（单号未
+占用、基线未推进）、数据库重开后可查、单渠道数千单的余数顺序，以及程序生成的
+一周与独立逐单参考实现交叉核对。

@@ -40,3 +40,22 @@ class DeliveryError(PlannerError):
     def __init__(self, message, code="delivery"):
         super().__init__(message)
         self.code = code
+
+
+class RewardError(PlannerError):
+    """A weekly reward delivery could not be validated or posted.
+
+    ``code`` distinguishes: ``invalid_inputs`` / ``invalid_pools`` /
+    ``invalid_week`` (not a Monday, or the file is not the whole week) /
+    ``invalid_digest`` (approved digest malformed) / ``digest_mismatch``
+    (bytes differ from the approved SHA-256) / ``invalid_delivery`` (manifest
+    or JSONL unparseable/ill-formed) / ``invalid_row`` (out-of-week, duplicate
+    or partial-attribution row) / ``version_mismatch`` (row and manifest
+    disagree) / ``immutable_pools`` / ``stale_predecessor`` /
+    ``receipt_conflict`` (same number, different content or parameters) /
+    ``unknown_receipt`` / ``read`` / ``write`` / ``state``.
+    """
+
+    def __init__(self, message, code="reward"):
+        super().__init__(message)
+        self.code = code

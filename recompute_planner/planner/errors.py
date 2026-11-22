@@ -19,3 +19,8 @@ class PlanError(PlannerError):
 
 class EventError(PlannerError):
     """Invalid late-arriving event."""
+
+
+class SnapshotError(PlannerError):
+    """Invalid upstream row snapshot: bad rows, duplicate ids, version/content
+    mismatch, or a node that is not an attribution upstream."""

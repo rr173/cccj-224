@@ -12,6 +12,11 @@ Graph definition format::
 
 Input spec fields (defaults in brackets): ``node`` (upstream, required),
 ``window`` (1), ``cross_day`` (false), ``global`` (false).
+
+A node may carry ``materialize: "attribution"``: a day-partitioned node whose
+partition results are materialized per order. Exactly one data flow is
+supported -- the node must read one same-day upstream (orders) and one
+7-day cross-day upstream (touches).
 """
 
 import re
@@ -19,6 +24,7 @@ import re
 from .errors import GraphError
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_MATERIALIZE_KINDS = ("attribution",)
 
 
 def normalize(gdef):
@@ -44,6 +50,12 @@ def normalize(gdef):
                 "global": bool(inp.get("global", False)),
             })
         nodes[name] = {"output": output, "inputs": inputs}
+        mat = spec.get("materialize")
+        if mat is not None:
+            if mat not in _MATERIALIZE_KINDS:
+                raise GraphError(
+                    f"{name}: materialize must be one of {_MATERIALIZE_KINDS}, got {mat!r}")
+            nodes[name]["materialize"] = mat
     norm = {"nodes": nodes}
     _validate(norm)
     return norm
@@ -76,7 +88,64 @@ def _validate(g):
                 if w > 1 and not inp["cross_day"]:
                     raise GraphError(
                         f"{v}: declared window {w} contradicts cross_day=false")
+    _validate_materialized(nodes)
     _check_acyclic(nodes)
+
+
+def _validate_materialized(nodes):
+    """Attribution nodes support exactly one data flow: same-day orders plus
+    a 7-day cross-day touches window. Upstream roles must be unambiguous."""
+    roles = {}
+    for v, spec in nodes.items():
+        if spec.get("materialize") != "attribution":
+            continue
+        if spec["output"] != "day":
+            raise GraphError(
+                f"{v}: attribution materialization requires day output, "
+                f"got {spec['output']!r}")
+        orders, touches = _role_inputs(spec)
+        if len(orders) != 1 or len(touches) != 1:
+            raise GraphError(
+                f"{v}: attribution node must read exactly one same-day orders input "
+                "(window=1, cross_day=false) and one touches input "
+                "(window=7, cross_day=true)")
+        if orders[0]["node"] == touches[0]["node"]:
+            raise GraphError(f"{v}: orders and touches inputs must be distinct nodes")
+        for inp, role in ((orders[0], "orders"), (touches[0], "touches")):
+            u = inp["node"]
+            if u in roles and roles[u] != role:
+                raise GraphError(
+                    f"node {u!r} is used as both orders and touches upstream")
+            roles[u] = role
+
+
+def _role_inputs(spec):
+    orders, touches = [], []
+    for inp in spec["inputs"]:
+        if inp["global"]:
+            continue
+        if inp["window"] == 1 and not inp["cross_day"]:
+            orders.append(inp)
+        elif inp["window"] == 7 and inp["cross_day"]:
+            touches.append(inp)
+    return orders, touches
+
+
+def attribution_roles(spec):
+    """(orders_node, touches_node) of a validated attribution node spec."""
+    orders, touches = _role_inputs(spec)
+    return orders[0]["node"], touches[0]["node"]
+
+
+def upstream_roles(gdef):
+    """{upstream node: 'orders' | 'touches'} across all attribution nodes."""
+    roles = {}
+    for spec in gdef["nodes"].values():
+        if spec.get("materialize") == "attribution":
+            o, t = attribution_roles(spec)
+            roles[o] = "orders"
+            roles[t] = "touches"
+    return roles
 
 
 def _check_acyclic(nodes):

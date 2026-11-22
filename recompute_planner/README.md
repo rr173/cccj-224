@@ -10,12 +10,16 @@
 ```
 planner/            产品实现
   api.py            门面接口：事件接收 / 依赖编译 / 影响裁剪 / 计划查询 / 状态推进
-  graph.py          图规范化与校验（缺边、成环、范围声明矛盾）
+                    / 上游快照登记 / 归因物化执行与读取
+  graph.py          图规范化与校验（缺边、成环、范围声明矛盾、物化节点形态）
   impact.py         纯函数影响传播与计划项构造（创建与重放共用，保证确定性）
+  attribution.py    归因纯逻辑：快照校验、逐单归因、按客户增量重算、读取边界记录
   dates.py / db.py  分区键日期运算 / SQLite schema
 reference/ref_impl.py  独立图算法参考实现（不调用产品计划器，只输出集合与前置关系）
-tests/test_planner.py  手算场景 + 全部边界用例
-examples/run_scenario.py  端到端演示
+tests/test_planner.py     计划器手算场景 + 全部边界用例
+tests/test_attribution.py 归因物化：独立逐单枚举交叉验证 + 增量/钉版/原子性用例
+examples/run_scenario.py    重算计划端到端演示
+examples/run_attribution.py 归因物化端到端演示
 ```
 
 ## 图声明
@@ -53,6 +57,44 @@ examples/run_scenario.py  端到端演示
 | `advance(pid, node, part, outcome)` | 状态推进：`running/success/failed`；前置失败 → 后继 `blocked`，保持未发布，绝不沿用旧版本假装完成 |
 | `replay_plan(pid)` | 按计划 ID 从绑定的输入快照确定性重放并比对 |
 | `close_plan(pid)` / `prune()` / `stats()` | 放弃计划（遗留转脏债）/ 有界保留 / 状态统计 |
+| `register_snapshot(node, day, version, rows)` | 上游版本发布后登记其完整行集（空快照用 `[]` 显式登记）；同版本同内容幂等，异内容拒绝；无效行/重复 ID 不留半份快照 |
+| `run_attribution_item(pid, node, part)` | 物化一个归因计划项：按计划项钉住的输入版本计算逐单结果，与所用输入版本、计划项成功发布同事务生效 |
+| `read_attribution(node, day, version)` | 按归因日期 + 精确版本号读逐单结果（订单 ID、命中触点日期/ID/渠道） |
+| `attribution_run_info(node, day, version)` | 物化元数据：full/incremental、基线版本、实际读入的输入版本、运行报告 |
+
+## 订单归因物化
+
+计划表只回答「哪个分区要重算到哪个版本」，营销侧还需要「这笔订单最终归给哪次触点」。
+在图里把归因节点标记为 `materialize: "attribution"` 即可启用（只支持这一条数据流，
+编译期校验形态）：
+
+```python
+{"nodes": {
+  "orders":  {"output": "day"},   # 订单，UTC 日分区
+  "touches": {"output": "day"},   # 触点，UTC 日分区
+  "attr":    {"output": "day", "materialize": "attribution",
+              "inputs": [{"node": "orders"},                            # 同日订单
+                         {"node": "touches", "window": 7,
+                          "cross_day": True}]},                         # 当日及前六日触点
+}}
+```
+
+- **归因规则**：订单只归到它发生时已存在的同客户触点（七个日分区内时间最晚者，
+  同时刻取触点 ID 字典序最小）；无匹配保留订单，归因字段为空。
+- **登记**：调用者在上游版本发布后按节点/日期/版本登记完整快照（行：非空字符串 ID、
+  客户 ID、落在该日的 UTC 时间；触点另带渠道）。快照不可变：同版本可重送相同内容，
+  不能替换成另一组行；缺失不等于空，空快照必须显式登记。
+- **钉版**：物化只读计划项 `input_versions` 钉住的版本，不读运行时最新版；任一输入
+  版本未登记（或前置项未完成）时拒绝执行，不发布部分或降级结果。
+- **增量**：有已物化基线（计划创建时锁定的旧归因版本）时，以基线实际使用的输入版本
+  为比较基线，只对版本不同的上游分区做增删改识别，只重算直接受影响的客户（触点/订单
+  换客户时新旧客户都算），其余行从旧结果复制；删除订单会移除旧行，删除获胜触点会
+  重新找出次选。运行报告里的 `reads` 记录每次读取的分区/版本/客户边界，可验证未变
+  分区里的无关客户从未被扫描。无基线时才按完整输入首算。
+- **原子性**：逐单结果、所用输入版本记录、计划项成功发布在同一个事务生效；归因节点
+  不能用 `advance(..., "success")` 绕过结果写入（其他节点沿用原路径）。提交失败时
+  旧结果仍可读、新版本不可见、该项可重试；成功过的项在计划保留期内不能重复发布；
+  重开数据库后旧结果仍按原版本读取。
 
 ## 关键不变量
 
@@ -70,8 +112,10 @@ examples/run_scenario.py  端到端演示
 
 ```bash
 cd recompute_planner
-python3 -m unittest tests.test_planner -v   # 19 项测试
-python3 examples/run_scenario.py            # 端到端演示
+python3 -m unittest tests.test_planner -v      # 19 项计划器测试
+python3 -m unittest tests.test_attribution -v  # 9 项归因物化测试
+python3 examples/run_scenario.py               # 重算计划端到端演示
+python3 examples/run_attribution.py            # 归因物化端到端演示
 ```
 
 ## 测试场景（手算）

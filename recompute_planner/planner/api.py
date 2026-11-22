@@ -20,10 +20,12 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 
+from .attribution import (SnapshotReader, attribute_all, attribute_customer,
+                          diff_customers, rows_digest, validate_rows)
 from .dates import gran_of, is_day
 from .db import connect
-from .errors import EventError, PlanError, StateError
-from .graph import normalize
+from .errors import EventError, PlanError, SnapshotError, StateError
+from .graph import attribution_roles, normalize, upstream_roles
 from .impact import build_plan_items, compute_impact
 
 _VERSION_RE = re.compile(r"v[0-9]+$")
@@ -95,6 +97,13 @@ class RecomputePlanner:
         grow = self.conn.execute(
             "SELECT def_json FROM graphs WHERE graph_id=?", (row["value"],)).fetchone()
         return row["value"], json.loads(grow["def_json"])
+
+    def _plan_graph(self, plan_row):
+        """Graph definition the plan is bound to (not necessarily current)."""
+        grow = self.conn.execute(
+            "SELECT def_json FROM graphs WHERE graph_id=?",
+            (plan_row["graph_id"],)).fetchone()
+        return json.loads(grow["def_json"])
 
     # ------------------------------------------------------------------
     # event ingestion
@@ -421,14 +430,15 @@ class RecomputePlanner:
         # running / success
         if item["status"] not in ("pending", "running"):
             raise PlanError(f"cannot mark {outcome} on item in status {item['status']}")
+        if outcome == "success":
+            spec = self._plan_graph(plan)["nodes"].get(node)
+            if spec is not None and spec.get("materialize") == "attribution":
+                raise PlanError(
+                    f"node {node!r} is attribution-materialized; use "
+                    "run_attribution_item() so results, input versions and the "
+                    "success publication commit atomically")
         waits = json.loads(item["waits_on_json"])
-        prereq = {}
-        for w in waits:
-            wn, wp = w.rsplit("/", 1)
-            r = self.conn.execute(
-                "SELECT status FROM plan_items WHERE plan_id=? AND node=? AND partition=?",
-                (plan_id, wn, wp)).fetchone()
-            prereq[w] = r["status"]
+        prereq = self._prereq_statuses(plan_id, waits)
         bad = [w for w, s in prereq.items() if s in ("failed", "blocked", "abandoned")]
         if bad:
             with self.conn:
@@ -464,6 +474,16 @@ class RecomputePlanner:
                 (plan_id, node, partition))
         self._finalize_if_done(plan_id)
         return {"status": "success", "version": item["new_version"]}
+
+    def _prereq_statuses(self, plan_id, waits):
+        prereq = {}
+        for w in waits:
+            wn, wp = w.rsplit("/", 1)
+            r = self.conn.execute(
+                "SELECT status FROM plan_items WHERE plan_id=? AND node=? AND partition=?",
+                (plan_id, wn, wp)).fetchone()
+            prereq[w] = r["status"]
+        return prereq
 
     def close_plan(self, plan_id):
         """Abandon an active plan; unfinished items become dirty debt."""
@@ -535,6 +555,269 @@ class RecomputePlanner:
                  f" ended {r['status']}", plan_id, _now()))
 
     # ------------------------------------------------------------------
+    # attribution snapshots (upstream row registration)
+    # ------------------------------------------------------------------
+    def register_snapshot(self, node, partition, version, rows):
+        """Register the complete row set of node/partition@version.
+
+        The version must already be published. Rows are validated and stored
+        atomically: invalid rows or duplicate ids leave nothing behind.
+        Re-registering identical content is a no-op; different content for the
+        same version is rejected (snapshots are immutable). An empty snapshot
+        must be registered explicitly with rows=[].
+        """
+        _, gdef = self._current_graph()
+        kind = upstream_roles(gdef).get(node)
+        if kind is None:
+            raise SnapshotError(
+                f"node {node!r} is not an orders/touches upstream of any "
+                "attribution node in the current graph")
+        if not is_day(partition):
+            raise SnapshotError(f"invalid partition {partition!r}; expected YYYY-MM-DD")
+        if not _VERSION_RE.match(version):
+            raise SnapshotError(f"version must look like 'vN', got {version!r}")
+        pub = self.conn.execute(
+            "SELECT 1 FROM published WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone()
+        if pub is None:
+            raise SnapshotError(
+                f"{node}/{partition}@{version} is not published; register snapshots"
+                " only after the upstream version is published")
+        norm_rows = validate_rows(kind, rows, partition)
+        digest = rows_digest(norm_rows)
+        existing = self.conn.execute(
+            "SELECT digest, row_count FROM node_snapshots"
+            " WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone()
+        if existing is not None:
+            if existing["digest"] == digest:
+                return {"result": "duplicate", "node": node, "partition": partition,
+                        "version": version, "rows": existing["row_count"]}
+            raise SnapshotError(
+                f"{node}/{partition}@{version} already registered with different "
+                "content; snapshots are immutable")
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO node_snapshots (node, partition, version, kind, digest,"
+                " row_count, registered_at) VALUES (?,?,?,?,?,?,?)",
+                (node, partition, version, kind, digest, len(norm_rows), _now()))
+            self.conn.executemany(
+                "INSERT INTO snapshot_rows (node, partition, version, row_id,"
+                " customer_id, ts, channel) VALUES (?,?,?,?,?,?,?)",
+                [(node, partition, version, r["id"], r["customer_id"], r["ts"],
+                  r["channel"]) for r in norm_rows])
+        return {"result": "registered", "node": node, "partition": partition,
+                "version": version, "kind": kind, "rows": len(norm_rows)}
+
+    def _snapshot_registered(self, node, partition, version):
+        return self.conn.execute(
+            "SELECT 1 FROM node_snapshots WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone() is not None
+
+    # ------------------------------------------------------------------
+    # attribution materialization
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_touches(reader, touches_node, day_versions, customers=None):
+        touches = []
+        for d, v in sorted(day_versions.items()):
+            for r in reader.rows(touches_node, d, v, customers=customers):
+                touches.append({**r, "date": d})
+        return touches
+
+    def run_attribution_item(self, plan_id, node, partition):
+        """Materialize one attribution plan item and publish it atomically.
+
+        Reads exactly the upstream versions pinned by the plan item (never the
+        runtime-latest), computes per-order results for the item's new
+        version, and commits results + used input versions + the item's
+        success publication in a single transaction. With a materialized
+        baseline (the attribution version locked at plan creation) only
+        customers directly affected by changed upstream partitions are
+        recomputed; every other row is copied from the baseline.
+        """
+        plan = self._require_plan(plan_id)
+        if plan["status"] != "active":
+            raise PlanError(f"plan {plan_id} is {plan['status']}; cannot run items")
+        gdef = self._plan_graph(plan)
+        spec = gdef["nodes"].get(node)
+        if spec is None or spec.get("materialize") != "attribution":
+            raise PlanError(
+                f"node {node!r} is not an attribution-materialized node in plan {plan_id}")
+        item = self.conn.execute(
+            "SELECT * FROM plan_items WHERE plan_id=? AND node=? AND partition=?",
+            (plan_id, node, partition)).fetchone()
+        if item is None:
+            raise PlanError(f"no item {node}/{partition} in plan {plan_id}")
+        if item["status"] == "success":
+            raise PlanError(
+                f"item {node}/{partition} already succeeded; re-publishing is "
+                "refused while the plan is retained")
+        if item["status"] not in ("pending", "running"):
+            raise PlanError(f"cannot run item in status {item['status']}")
+        waits = json.loads(item["waits_on_json"])
+        prereq = self._prereq_statuses(plan_id, waits)
+        bad = [w for w, s in prereq.items() if s in ("failed", "blocked", "abandoned")]
+        if bad:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE plan_items SET status='blocked'"
+                    " WHERE plan_id=? AND node=? AND partition=?",
+                    (plan_id, node, partition))
+                blocked = self._block_dependents(plan_id, [(node, partition)])
+            self._finalize_if_done(plan_id)
+            return {"status": "blocked", "reason": f"prerequisite failed/blocked: {bad}",
+                    "blocked": [f"{n}/{p}" for n, p in blocked]}
+        incomplete = [w for w, s in prereq.items() if s != "success"]
+        if incomplete:
+            raise PlanError(
+                f"prerequisites not complete for {node}/{partition}: {incomplete}")
+
+        orders_node, touches_node = attribution_roles(spec)
+        input_versions = json.loads(item["input_versions_json"])
+        pinned = ([(orders_node, d, v)
+                   for d, v in sorted(input_versions[orders_node].items())]
+                  + [(touches_node, d, v)
+                     for d, v in sorted(input_versions[touches_node].items())])
+        missing = []
+        for n, d, v in pinned:
+            if v is None:
+                missing.append(f"{n}/{d} (unpublished)")
+            elif not self._snapshot_registered(n, d, v):
+                missing.append(f"{n}/{d}@{v}")
+        if missing:
+            raise PlanError(
+                "attribution inputs not registered: " + ", ".join(missing)
+                + "; register the complete snapshot of every input partition "
+                "(empty ones explicitly) before running the item")
+
+        # baseline = the attribution version locked when the plan was created,
+        # but only if its results were actually materialized
+        snapshot = json.loads(plan["snapshot_json"])
+        base_ver = (snapshot.get(f"{node}|{partition}") or {}).get("v")
+        base_run = None
+        if base_ver is not None:
+            base_run = self.conn.execute(
+                "SELECT * FROM attribution_runs"
+                " WHERE node=? AND partition=? AND version=?",
+                (node, partition, base_ver)).fetchone()
+
+        reader = SnapshotReader(self.conn)
+        orders_ver = input_versions[orders_node][partition]
+        if base_run is None:
+            mode = "full"
+            orders = reader.rows(orders_node, partition, orders_ver)
+            touches = self._read_touches(reader, touches_node,
+                                         input_versions[touches_node])
+            rows = attribute_all(orders, touches)
+            changed, affected, copied = None, None, 0
+        else:
+            mode = "incremental"
+            base_inputs = json.loads(base_run["input_versions_json"])
+            changed = []
+            for n, d, v in pinned:
+                bv = (base_inputs.get(n) or {}).get(d)
+                if bv != v:
+                    changed.append({"node": n, "partition": d, "from": bv, "to": v})
+            affected = set()
+            for c in changed:
+                old_rows = reader.rows(c["node"], c["partition"], c["from"])
+                new_rows = reader.rows(c["node"], c["partition"], c["to"])
+                affected |= diff_customers(old_rows, new_rows)
+            base_rows = self.conn.execute(
+                "SELECT * FROM attribution_results"
+                " WHERE node=? AND partition=? AND version=?",
+                (node, partition, base_ver)).fetchall()
+            kept = [{"order_id": r["order_id"], "customer_id": r["customer_id"],
+                     "order_ts": r["order_ts"], "touch_date": r["touch_date"],
+                     "touch_id": r["touch_id"], "channel": r["channel"]}
+                    for r in base_rows if r["customer_id"] not in affected]
+            recomputed = []
+            for cust in sorted(affected):
+                c_orders = reader.rows(orders_node, partition, orders_ver,
+                                       customers={cust})
+                c_touches = self._read_touches(reader, touches_node,
+                                               input_versions[touches_node],
+                                               customers={cust})
+                recomputed += attribute_customer(c_orders, c_touches)
+            rows = kept + recomputed
+            copied = len(kept)
+        rows.sort(key=lambda r: r["order_id"])
+
+        new_ver = item["new_version"]
+        report = {
+            "plan_id": plan_id, "node": node, "partition": partition,
+            "version": new_ver, "mode": mode,
+            "baseline_version": base_ver if base_run else None,
+            "input_versions": input_versions,
+            "changed_inputs": changed,
+            "affected_customers": sorted(affected) if affected is not None else None,
+            "rows_total": len(rows), "rows_recomputed": len(rows) - copied,
+            "rows_copied": copied, "reads": reader.reads,
+        }
+        evidence = {"inputs": input_versions, "reasons": json.loads(item["reason_json"]),
+                    "plan_id": plan_id, "materialized": mode}
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO attribution_results (node, partition, version, order_id,"
+                " customer_id, order_ts, touch_date, touch_id, channel)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                [(node, partition, new_ver, r["order_id"], r["customer_id"],
+                  r["order_ts"], r["touch_date"], r["touch_id"], r["channel"])
+                 for r in rows])
+            self.conn.execute(
+                "INSERT INTO attribution_runs (node, partition, version, plan_id, mode,"
+                " baseline_version, input_versions_json, report_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (node, partition, new_ver, plan_id, mode,
+                 base_ver if base_run else None, _canon(input_versions),
+                 _canon(report), _now()))
+            self.conn.execute(
+                "INSERT INTO published (node, partition, version, evidence_json, source,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (node, partition, new_ver, _canon(evidence), plan_id, _now()))
+            self.conn.execute(
+                "UPDATE plan_items SET status='success'"
+                " WHERE plan_id=? AND node=? AND partition=?",
+                (plan_id, node, partition))
+        self._finalize_if_done(plan_id)
+        return report
+
+    def read_attribution(self, node, partition, version):
+        """Per-order results of one materialized attribution version.
+
+        Raises StateError when that version was never materialized; an empty
+        list means the version was materialized with no orders.
+        """
+        run = self.conn.execute(
+            "SELECT 1 FROM attribution_runs WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone()
+        if run is None:
+            raise StateError(
+                f"no materialized attribution results for {node}/{partition}@{version}")
+        rows = self.conn.execute(
+            "SELECT * FROM attribution_results WHERE node=? AND partition=? AND version=?"
+            " ORDER BY order_id", (node, partition, version)).fetchall()
+        return [{"order_id": r["order_id"], "customer_id": r["customer_id"],
+                 "order_ts": r["order_ts"], "touch_date": r["touch_date"],
+                 "touch_id": r["touch_id"], "channel": r["channel"]} for r in rows]
+
+    def attribution_run_info(self, node, partition, version):
+        """Materialization metadata: mode, baseline, input versions actually
+        read, and the run report (changed inputs, affected customers, reads)."""
+        r = self.conn.execute(
+            "SELECT * FROM attribution_runs WHERE node=? AND partition=? AND version=?",
+            (node, partition, version)).fetchone()
+        if r is None:
+            raise StateError(
+                f"no materialized attribution run for {node}/{partition}@{version}")
+        return {"node": r["node"], "partition": r["partition"], "version": r["version"],
+                "plan_id": r["plan_id"], "mode": r["mode"],
+                "baseline_version": r["baseline_version"],
+                "input_versions": json.loads(r["input_versions_json"]),
+                "report": json.loads(r["report_json"]), "created_at": r["created_at"]}
+
+    # ------------------------------------------------------------------
     # bounded retention
     # ------------------------------------------------------------------
     def _prune(self):
@@ -565,4 +848,7 @@ class RecomputePlanner:
             "plans_total": c("SELECT COUNT(*) FROM plans"),
             "plans_active": c("SELECT COUNT(*) FROM plans WHERE status='active'"),
             "published_rows": c("SELECT COUNT(*) FROM published"),
+            "snapshots_registered": c("SELECT COUNT(*) FROM node_snapshots"),
+            "attribution_runs": c("SELECT COUNT(*) FROM attribution_runs"),
+            "attribution_rows": c("SELECT COUNT(*) FROM attribution_results"),
         }

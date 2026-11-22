@@ -71,6 +71,63 @@ CREATE TABLE IF NOT EXISTS dirty_debt (
     consumed_by      TEXT,
     created_at       TEXT NOT NULL
 );
+
+-- Complete row snapshots registered per upstream node/day/version.
+-- Registration is atomic; re-registering the same version with identical
+-- content is a no-op, with different content is rejected.
+CREATE TABLE IF NOT EXISTS node_snapshots (
+    node          TEXT NOT NULL,
+    partition     TEXT NOT NULL,          -- day key
+    version       TEXT NOT NULL,          -- 'vN'
+    kind          TEXT NOT NULL,          -- orders | touches
+    digest        TEXT NOT NULL,
+    row_count     INTEGER NOT NULL,
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY (node, partition, version)
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_rows (
+    node        TEXT NOT NULL,
+    partition   TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    row_id      TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    ts          TEXT NOT NULL,            -- canonical UTC, fixed width
+    channel     TEXT,                     -- touches only
+    PRIMARY KEY (node, partition, version, row_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_rows_customer
+    ON snapshot_rows (node, partition, version, customer_id);
+
+-- One row per materialized attribution version: which input versions were
+-- actually read, which baseline (if any) was reused, and the run report.
+CREATE TABLE IF NOT EXISTS attribution_runs (
+    node                TEXT NOT NULL,
+    partition           TEXT NOT NULL,
+    version             TEXT NOT NULL,
+    plan_id             TEXT NOT NULL,
+    mode                TEXT NOT NULL,    -- full | incremental
+    baseline_version    TEXT,
+    input_versions_json TEXT NOT NULL,
+    report_json         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (node, partition, version)
+);
+
+-- Per-order attribution results, immutable per version.
+CREATE TABLE IF NOT EXISTS attribution_results (
+    node        TEXT NOT NULL,
+    partition   TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    order_id    TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    order_ts    TEXT NOT NULL,
+    touch_date  TEXT,                     -- NULL when unattributed
+    touch_id    TEXT,
+    channel     TEXT,
+    PRIMARY KEY (node, partition, version, order_id)
+);
 """
 
 
